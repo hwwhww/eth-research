@@ -1,6 +1,6 @@
 # Full Casper chain v2.1
 
-## WORK IN PROGRESS!!!!1!!1! by @vbuterin - 20180721 21:48 (UTC+8)
+## WORK IN PROGRESS!!!!1!!1!
 
 This is the work-in-progress document describing the specification for the Casper+Sharding chain, version 2.1.
 
@@ -10,7 +10,6 @@ The primary source of load on the PoS chain is **attestations**. An attestation 
 
 1. It attests to some parent block in the beacon chain
 2. It attests to a block hash in a shard (a sufficient number of such attestations create a "cross-link", confirming that shard block into the main chain).
-
 
 Every shard (e.g. there might be 1024 shards in total) is itself a PoS chain, and the shard chains are where the transactions and accounts will be stored. The cross-links serve to "confirm" segments of the shard chains into the main chain, and are also the primary way through which the different shards will be able to talk to each other.
 
@@ -177,11 +176,13 @@ Block production is significantly different because of the proof of stake mechan
 
 The beacon chain uses the Casper FFG fork choice rule of "favor the chain containing the highest-epoch justified checkpoint". To choose between chains that are all descended from the same justified checkpoint, the chain uses "recursive proximity to justification" to choose a checkpoint, then uses GHOST within an epoch.
 
-RPJ works as follows. First, start at the latest justified checkpoint. Then, choose the descendant checkpoint that has the most attestations supporting it. Repeat until you get to a checkpoint with no children.
+RPJ works as follows. First, start at the latest justified checkpoint. Then, choose the descendant checkpoint that has the most attestations supporting it. Repeat until you get to a checkpoint with no children (in this phase, only checkpoints whose epochs are completed, ie. epoch N where the timeslots for epoch N+1 have already begun, are admissible)
 
 For example:
 
-![](https://yuml.me/8d100380.png =225x600)
+![](https://vitalik.ca/files/8d100380.png =225x600)
+
+From the child chosen by RPJ, use GHOST to find the head of the chain.
 
 ## Beacon chain state transition function
 
@@ -216,7 +217,7 @@ def get_shuffling(seed, validator_count):
     return o
 ```
 
-The following algorithm is used to split up validators into groups at the start of every epoch, determining at what height they can make attestations and what shard they are making crosslinks for:
+Then, an algorithm that we use to split up validators into groups at the start of every epoch, determining at what height they can make attestations and what shard they are making crosslinks for:
      
 ```python
 def get_cutoffs(validator_count):
@@ -246,9 +247,9 @@ def get_cutoffs(validator_count):
     
     # For the validators assigned to each height, split them up
     # into committees for different shards. Do not assign the
-    # last 8 heights in an epoch to any shards.
+    # last END_EPOCH_GRACE_PERIOD heights in an epoch to any shards.
     shard_cutoffs = [0]
-    for i in range(EPOCH_LENGTH - 8):
+    for i in range(EPOCH_LENGTH - END_EPOCH_GRACE_PERIOD):
         size = height_cutoffs[i+1] - height_cutoffs[i]
         shards = (size + STANDARD_COMMITTEE_SIZE - 1) // STANDARD_COMMITTEE_SIZE
         pre = shard_cutoffs[-1]
@@ -259,6 +260,10 @@ def get_cutoffs(validator_count):
 ```
 
 This splits up the validator set into groups for each height, and within each height into groups for different shards. Note that if the validator set is too small to support a committee at every height, some heights are simply left "inactive".
+
+Here's a depiction of what is going on with reduced parameters for simplicity of exposition:
+
+![](http://vitalik.ca/files/ShuffleAndAssign.png)
 
 The `current_shuffling` is recalculated at the start of a dynasty transition.
 
@@ -273,11 +278,11 @@ A block can have 0 or more `AggregateVote` objects, where each `AggregateVote` o
 ```python
 fields = {
     'height': 'int16',
-    'parent': 'hash32',
+    'parent_hash': 'hash32',
     'checkpoint_hash': 'hash32',
     'shard_id': 'int16',
     'shard_block_hash': 'hash32',
-    'notary_bitfield': 'bytes',
+    'attester_bitfield': 'bytes',
     'aggregate_sig': ['int256']
 }
 ```
@@ -285,18 +290,19 @@ fields = {
 For each one of these votes:
 
 * Verify that `height <= slot_number`
-* Verify that `height >= slot_number = slot_number % EPOCH_LENGTH`
-* Use `get_cutoffs` above to get the index cutoffs for the heights and the shards. If `height_in_epoch < EPOCH_LENGTH - 8`, verify that `si = (shard_id - next_shard) % SHARD_COUNT` is a valid shard index for that height (ie. check `height_cutoffs[height_in_epoch] <= shard_cutoffs[si] < height_cutoffs[height_in_epoch + 1])`). Otherwise, verify `shard_id == 65535` and `shard_block_hash == 0`.
+* Use `get_cutoffs` above to get the index cutoffs for the heights and the shards.
+    * If `height_in_epoch < EPOCH_LENGTH - END_EPOCH_GRACE_PERIOD`, verify that `si = (shard_id - next_shard) % SHARD_COUNT` is a valid shard index for that height (ie. check `height_cutoffs[height_in_epoch] <= shard_cutoffs[si] < height_cutoffs[height_in_epoch + 1])`).
+    * Otherwise, verify `shard_id == 65535` and `shard_block_hash == 0`.
 * If `height_in_epoch < EPOCH_LENGTH - 8`, let `start = shard_cutoffs[si]` and `end = shard_cutoffs[si+1]`. Otherwise, let `start = height_cutoffs[height_in_epoch]` and `end = height_cutoffs[height_in_epoch + 1]`
-* Verify that `len(notary_bitfield) == ceil_div8(end - start)`, where `ceil_div8 = (x + 7) // 8`. Verify that bits `end-start....` and higher, if present (ie. `end-start` is not a multiple of 8), are all zero
-* Take all indices `0 <= i < end-start` where the ith bit of `notary_bitfield` equals 1, take `start+i` as the indices of those validators, extract their pubkeys, and add them all together to generate the group pubkey.
+* Verify that `len(attester_bitfield) == ceil_div8(end - start)`, where `ceil_div8 = (x + 7) // 8`. Verify that bits `end-start....` and higher, if present (ie. `end-start` is not a multiple of 8), are all zero
+* Take all indices `0 <= i < end-start` where the ith bit of `attester_bitfield` equals 1, take `current_epoch_shuffling[start+i]` as the indices of those validators, extract their pubkeys, and add them all together to generate the group pubkey.
 * Verify that the `checkpoint_hash` matches the `current_checkpoint`
 * Verify that the `aggregate_sig` verifies using the group pubkey and `hash(height_in_epoch + parent + checkpoint_hash + shard_id + shard_block_hash)` as the message.
 * AND all indices taken above into the `attester_bitfield`. Add the `balance` of any newly added validators into the `total_attester_deposits`.
 
 Extend the list of `AggregateVote` objects in the `active_state` , ordering the new additions by `shard_block_hash`.
 
-Verify that the `AggregateVote` objects include the first attester at that height (ie. `height_cutoffs[height_in_epoch]`); this attester will be the proposer of the block.
+Verify that one of the `AggregateVote` objects includes the first attester at the current height (ie. `current_epoch_shuffling[height_cutoffs[height_in_epoch]]`); this attester can be considered to be the proposer of the block.
 
 ### Epoch transitions
 
@@ -307,16 +313,16 @@ When the current block height (ie. the height in the active state) is 0 mod SHAR
 * If `total_attester_deposits * 3 >= total_deposits * 2`, set `crystallized_state.justified_epoch` to equal `crystallized_state.current_epoch` (note: this is still the previous epoch at this point in the computation). If this happens, and the justified epoch was previously `crystallized_state.current_epoch - 1`, set the `crystallized_state.finalized_epoch` to equal that value.
 * Compute the `online_reward` and `offline_penalty` based on the Casper FFG incentive and quadratic leak rules (not yet fully specified)
 * Add the `online_reward` to every validator who participated in the last epoch, and subtract the `offline_penalty` from everyone who did not
+* Set `attester_bitfield` to be all zeroes, with length `ceil_div8(len(active_validators))`. Set `total_attester_deposits` to 0
 
 ### Calculate rewards for crosslinks
 
 Repeat for every shard S:
 
-* Take the set of `shard_block_hash` values that have been proposed for S (call this ROOTS)
+* Take the set of `shard_block_hash` values that have been proposed for S in the attestations (call this set ROOTS)
 * Take the ROOT in ROOTS such that the total deposit size of the subset of validators that have voted for `shard_block_hash` ROOT and `shard_id` S is maximal; call this BESTROOT
 * For every validator that voted for BESTROOT, increment their balance by `online_crosslink_reward`. For everyone else who was assigned to a shard (ie. not the proposers of the last 8 blocks), decrement their balance by `offline_crosslink_penalty`
 * If the size of the subset that voted * 3 >= `total_deposits * 2`, and `crosslink_records[shard_id].epoch < last_finalized_epoch`, set `crosslink_records[shard_id]` to `{epoch: current_epoch, hash: BESTROOT}`
-
 
 ### Reshuffling
 
@@ -326,18 +332,22 @@ The exponential backoff ensures that, if there has not been a crosslink for N ep
 
 ### Dynasty transition
 
-If the last two epochs were both justified, then:
+If:
 
-* Set `crystallized_state.dynasty += 1`
-* Set `crosslink_seed = blake(crosslink_seed)` # Pending a real RNG
+1. The last two epochs were both justified
+2. `crosslink_records[shard_id].epoch >= last_finalized_epoch` for every `shard_id` where `(shard_id - next_shard) % SHARD_COUNT < len(shard_cutoffs)`(ie. every crosslink that was supposed to be updated actually was updated)
+
+Then:
+
+* Set `crystallized_state.current_dynasty += 1`
+* Set `crosslink_seed = blake(crosslink_seed)` **# Pending a real RNG**
 * Go through all `queued_validators`, in order from first to last. Any validators whose `switch_dynasty` is equal to or earlier than the new dynasty are immediately added to the end of `active_validators` (setting `switch_dynasty` to the highest possible integer), up to a maximum of `(len(crystallized_state.active_validators) // 30) + 1` (notice that because `queued_validators` is sorted, it suffices to check the queued validators at the beginning until either you've processed that many, or you reach one whose `switch_dynasty` is later than the current dynasty)
 * Go through all `active_valdidators`, and move any with either (i) balance equal to <= 50% of their initial balance, or (ii) `switch_dynasty` equal to or less than the new current dynasty, to `exited_validators`, moving up to a maximum of `(len(crystallized_state.active_validators) // 30) + 1` validators
 
 ### Miscellaneous
 
-* Increment the current epoch
+* Set `current_epoch += 1`
 * Set the `current_checkpoint` to the hash of the previous block
-* Reset the FFG voter bitfield and AggregateVote list
 
 
 -------
