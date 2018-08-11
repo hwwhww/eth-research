@@ -28,7 +28,9 @@ Note: the python code at https://github.com/ethereum/beacon_chain and [an ethres
 * **Shard chain** - one of the chains on which transactions take place and account data is stored.
 * **Crosslink** - a set of signatures from a committee attesting to a block in a shard chain, which can be included into the beacon chain. Crosslinks are the main means by which the beacon chain "learns about" the updated state of shard chains.
 * **Slot** - a period of 8 seconds, during which one proposer has the ability to create a block and some attesters have the ability to make attestations
-* **Epoch** - a period of EPOCH_LENGTH slots.
+* **Dynasty transition** - a change of the validator set
+* **Dynasty** - the number of dynasty transitions that have happened in a given chain since genesis
+* **Cycle** - a period during which all validators get exactly one chance to vote (unless a dynasty transition happens inside of one)
 * **Finalized**, **justified** - see Casper FFG finalization here: https://arxiv.org/abs/1710.09437
 
 ### Constants
@@ -37,7 +39,7 @@ Note: the python code at https://github.com/ethereum/beacon_chain and [an ethres
 * **DEPOSIT_SIZE** - 32 ETH
 * **MAX_VALIDATOR_COUNT** - 2<sup>22</sup> = 4194304 # Note: this means that up to ~134 million ETH can stake at the same time
 * **SLOT_DURATION** - 8 seconds
-* **EPOCH_LENGTH** - 64 slots
+* **CYCLE_LENGTH** - 64 slots
 * **MIN_COMMITTEE_SIZE** - 128 (rationale: see recommended minimum 111 here https://vitalik.ca/files/Ithaca201807_Sharding.pdf)
 
 ### PoW main chain changes
@@ -84,7 +86,7 @@ Here's the `ActiveState`:
 fields = {
     # Attestations that have not yet been processed
     'pending_attestations': [AttestationRecord],
-    # Most recent 64 block hashes
+    # Most recent 2 * CYCLE_LENGTH block hashes, older to newer
     'recent_block_hashes': ['hash32']
 }
 ```
@@ -95,11 +97,12 @@ Here's the `CrystallizedState`:
 fields = {
     # List of validators
     'validators': [ValidatorRecord],
-    # Epoch number
-    'epoch_number': 'int64',
+    # Last CrystallizedState recalculation
+    'last_state_recalc': 'int64',
     # What active validators are part of the attester set
-    # at what height, and in what shard
-    'indices_for_heights': [[ShardAndIndices]],
+    # at what height, and in what shard. Starts at slot
+    # last_state_recalc - CYCLE_LENGTH
+    'indices_for_heights': [[ShardAndCommittee]],
     # The last justified slot
     'last_justified_slot': 'int64',
     # Number of consecutive justified slots ending at this one
@@ -110,8 +113,6 @@ fields = {
     'current_dynasty': 'int64',
     # The next shard that crosslinking assignment will start from
     'crosslinking_start_shard': 'int16',
-    # The current FFG checkpoint
-    'current_checkpoint': 'hash32',
     # Records about the most recent crosslink `for each shard
     'crosslink_records': [CrosslinkRecord],
     # Total balance of deposits
@@ -123,14 +124,14 @@ fields = {
 }
 ```
 
-A `ShardAndIndices` object is of the form:
+A `ShardAndCommittee` object is of the form:
 
 ```python
 fields = {
     # The shard ID
     'shard_id': 'int16',
     # Validator indices
-    'validators': ['int24']
+    'committee': ['int24']
 }
 ```
 
@@ -160,8 +161,8 @@ And a CrosslinkRecord contains information about the last fully formed crosslink
 
 ```python
 fields = {
-    # What epoch the crosslink was submitted in
-    'epoch': 'int64',
+    # What dynasty the crosslink was submitted in
+    'dynasty': 'int64',
     # The block hash
     'hash': 'hash32'
 }
@@ -187,11 +188,17 @@ The beacon chain uses the Casper FFG fork choice rule of "favor the chain contai
 
 For a description see: **https://ethresear.ch/t/beacon-chain-casper-ffg-rpj-mini-spec/2760**
 
+For an implementation with a network simulator see: **https://github.com/ethereum/research/blob/master/clock_disparity/ghost_node.py**
+
+Here's an example of its working (green is finalized blocks, yellow is justified, grey is attestations):
+
+![](https://vitalik.ca/files/RPJ.png)
+
 ## Beacon chain state transition function
 
 We now define the state transition function. At the high level, the state transition is made up of two parts:
 
-1. The epoch transition, which happens only if `slot_number >= (epoch_number + 1) // EPOCH_LENGTH`, and affects the `CrystallizedState` and `ActiveState`
+1. The crystallized state realculation, which happens only if `slot_number >= last_state_recalc + CYCLE_LENGTH`, and affects the `CrystallizedState` and `ActiveState`
 2. The per-block processing, which happens every block (if during an epoch transition block, it happens after the epoch transition), and affects the `ActiveState` only
 
 The epoch transition generally focuses on changes to the validator set, including adjusting balances and adding and removing validators, as well as processing crosslinks and setting up FFG checkpoints, and the per-block processing generally focuses on verifying aggregate signatures and saving temporary records relating to the in-block activity in the `ActiveState`.
@@ -201,7 +208,7 @@ The epoch transition generally focuses on changes to the validator set, includin
 We start off by defining some helper algorithms. First, the function that selects the active validators:
 
 ```python
-def get_active_validator_indices():
+def get_active_validator_indices(validators, dynasty):
     o = []
     for i in range(len(validators)):
         if validators[i].start_dynasty <= dynasty < \
@@ -215,7 +222,7 @@ Now, a function that shuffles this list:
 ```python
 def shuffle(lst, seed):
     assert len(lst) <= 16777216
-    rand_max = 16777216 - 16777216 % validator_count
+    rand_max = 16777216 - 16777216 % len(lst)
     o = [x for x in lst]
     source = seed
     i = 0
@@ -223,10 +230,10 @@ def shuffle(lst, seed):
         source = blake(source)
         for pos in range(0, 30, 3):
             m = int.from_bytes(source[pos:pos+3], 'big')
-            remaining = validator_count - i
+            remaining = len(lst) - i
             if remaining == 0:
                 break
-            if validator_count < rand_max:
+            if len(lst) < rand_max:
                 replacement_pos = (m % remaining) + i
                 o[i], o[replacement_pos] = o[replacement_pos], o[i]
                 i += 1
@@ -243,72 +250,97 @@ def split(lst, N):
 Now, our combined helper method:
 
 ```python
-def get_new_shuffling():
-    avs = get_active_validator_set(validators)
-    if len(avs) >= EPOCH_LENGTH * MIN_COMMITTEE_SIZE:
-        committees_per_slot = int(len(avs) // EPOCH_LENGTH // (MIN_COMMITTEE_SIZE * 2)) + 1 
+def get_new_shuffling(seed, validators, dynasty, crosslinking_start_shard):
+    avs = get_active_validator_indices(validators, dynasty)
+    if len(avs) >= CYCLE_LENGTH * MIN_COMMITTEE_SIZE:
+        committees_per_slot = int(len(avs) // CYCLE_LENGTH // (MIN_COMMITTEE_SIZE * 2)) + 1 
         slots_per_committee = 1
     else:
         committees_per_slot = 1
         slots_per_committee = 1
-        while len(avs) * slots_per_committee < EPOCH_LENGTH * MIN_COMMITTEE_SIZE and slots_per_committee < EPOCH_LENGTH:
+        while len(avs) * slots_per_committee < CYCLE_LENGTH * MIN_COMMITTEE_SIZE and slots_per_committee < CYCLE_LENGTH:
             slots_per_committee *= 2
     o = []
-    for i, height_indices in enumerate(split(shuffle(avs), EPOCH_LENGTH)):
+    for i, height_indices in enumerate(split(shuffle(avs, seed), CYCLE_LENGTH)):
         shard_indices = split(height_indices, committees_per_slot)
-        o.append([{
-            'shard_id': crosslinking_start_shard + 
-                         i * committees_per_slot // slots_per_committee + j,
-            'committee': indices
-        } for indices in shard_indices])
+        o.append([ShardAndCommittee(
+            shard_id = crosslinking_start_shard + 
+                       i * committees_per_slot // slots_per_committee + j,
+            committee = indices
+        ) for j, indices in enumerate(shard_indices)])
     return o
 ```
-
-Call `get_new_shuffling()` and concatenate the result to itself to instantiate the initial value of `indices_for_heights` at genesis.
 
 Here's a diagram of what's going on:
 
 ![](http://vitalik.ca/files/ShuffleAndAssign.png?1)
 
+### On startup
+
+* Let `x = get_new_shuffling(bytes([0] * 32), validators, 1, 0)` and set `crystallized_state.indices_for_heights` to `x + x`
+* Set `crystallized_state.dynasty = 1`
+* Set `crystallized_state.crosslink_records` to `[CrosslinkRecord(dynasty=0, hash= bytes([0] * 32)) for i in range(SHARD_COUNT)]`
+* Set `total_deposits` to `sum([x.balance for x in validators])`
+* Set `recent_block_hashes` to `[bytes([0] * 32) for _ in range(CYCLE_LENGTH * 2)]`
+
+All other values in active and crystallized state can be set to zero or empty arrays depending on context.
+
 ### Per-block processing
+
+First, set `recent_block_hashes` to the output of the following:
+
+```python
+def get_new_recent_block_hashes(old_block_hashes, parent_slot,
+                                current_slot, parent_hash):
+    d = current_slot - parent_slot
+    return old_block_hashes[d:] + [parent_hash] * min(d, len(old_block_hashes))
+```
 
 A block can have 0 or more `AttestationRecord` objects, where each `AttestationRecord` object has the following fields:
 
 ```python
 fields = {
+    # Slot number
     'slot': 'int64',
+    # Shard ID
     'shard_id': 'int16',
+    # List of block hashes that this signature is signing over that
+    # are NOT part of the current chain, in order of oldest to newest
     'oblique_parent_hashes': ['hash32'],
+    # Block hash in the in the in the shard that we are attesting to
     'shard_block_hash': 'hash32',
+    # Who is participating
     'attester_bitfield': 'bytes',
+    # The actual signature
     'aggregate_sig': ['int256']
 }
 ```
 
 For each one of these votes [TODO]:
 
-* Verify that `slot < block.slot_number`
-* Compute `parent_hashes` = `oblique_parent_hashes + recent_block_hashes[block.slot_number - slot + len(oblique_parent_hashes):]`
-* Set `last_epoch_start = (epoch_number - 1) * EPOCH_LENGTH
-* Find the `indices_for_heights[slot - last_epoch_start][x].validators`, choosing `x` so that `indices_for_heights[slot - next_epoch_start][x].shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record. Call the index list that you get from this `attestation_indices`
-* Verify that `len(attester_bitfield) == ceil_div8(len(attestation_indices))`, where `ceil_div8 = (x + 7) // 8`. Verify that bits `end-start....` and higher, if present (i.e. `end-start` is not a multiple of 8), are all zero
+* Verify that `slot < block.slot_number` and `slot > max(block.slot_number - CYCLE_LENGTH, 0)`
+* Compute `parent_hashes` = `recent_block_hashes[CYCLE_LENGTH + slot - block.slot_number: CYCLE_LENGTH * 2 + slot - block.slot_number - len(oblique_parent_hashes)] + oblique_parent_hashes`
+* Find the `indices_for_heights[slot - last_state_recalc - CYCLE_LENGTH][x].validators`, choosing `x` so that `indices_for_heights[slot - last_epoch_start][x].shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record. Call the index list that you get from this `attestation_indices`
+* Verify that `len(attester_bitfield) == ceil_div8(len(attestation_indices))`, where `ceil_div8 = (x + 7) // 8`. Verify that bits `len(attestation_indices)....` and higher, if present (i.e. `len(attestation_indices)` is not a multiple of 8), are all zero
 * Derive a group public key by adding the public keys of all of the attesters in `attestation_indices` for whom the corresponding bit in `attester_bitfield` (the ith bit is `(attester_bitfield[i // 8] >> (7 - (i %8))) % 2`) equals 1
-* Verify that `aggregate_sig` verifies using the group pubkey generated and `hash((slot % EPOCH_LENGTH) + parent_hashes + shard_id + shard_block_hash)` as the message.
+* Verify that `aggregate_sig` verifies using the group pubkey generated and `hash((slot % CYCLE_LENGTH) + parent_hashes + shard_id + shard_block_hash)` as the message.
 
 Extend the list of `AttestationRecord` objects in the `active_state`, ordering the new additions in the same order as they came in the block.
 
-Verify that one of the `AttestationRecord` objects includes the first attester at the current height (i.e. `current_epoch_shuffling[height_cutoffs[slot % EPOCH_LENGTH]]`); this attester can be considered to be the proposer of the block.
+Verify that the `slot % len(indices_for_heights[slot-1][0])`'th attester in `indices_for_heights[slot-1][0]`is part of at least one of the `AttestationRecord` objects; this attester can be considered to be the proposer of the block.
 
-### Epoch transitions
+### Cycle length recalculations
 
-For all slots `s` in `(epoch_number - 2) * EPOCH_LENGTH ... (epoch_number - 1) * EPOCH_LENGTH - 1`:
+For all slots `s` in `last_state_recalc - CYCLE_LENGTH ... last_state_recalc - 1`:
 
 * Determine the total set of validators that voted for that block at least once
 * Determine the total balance of these validators. If this value times three equals or exceeds the total balance of all active validators times two, set `last_justified_slot = max(last_justified_slot, s)` and `justified_streak += 1`. Otherwise, set `justified_streak = 0`
-* If `justified_streak >= 65`, set `last_finalized_slot = max(last_finalized_slot, s)`
-* Remove all attestation records older than slot `(epoch_number - 1) * EPOCH_LENGTH`
-* Set `epoch_number += 1`
-* Set `indices_for_heights[:EPOCH_LENGTH] = indices_for_heights[EPOCH_LENGTH:]`
+* If `justified_streak >= CYCLE_LENGTH + 1`, set `last_finalized_slot = max(last_finalized_slot, s)`
+* Remove all attestation records older than slot `last_state_recalc`
+* Set `last_state_recalc = slot`
+* Set `indices_for_heights[:CYCLE_LENGTH] = indices_for_heights[CYCLE_LENGTH:]`
+
+For all (`shard_id`, `shard_block_hash`) tuples, compute the total deposit size of validators that voted for that block hash for that shard. If this value times three equals or exceeds the total balance of all validators in the committee times two, and the current dynasty exceeds `crosslink_records[shard_id].dynasty`, set `crosslink_records[shard_id] = CrosslinkRecord(dynasty=current_dynasty, hash=shard_block_hash)`.
 
 TODO:
 
