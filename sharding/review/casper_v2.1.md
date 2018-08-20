@@ -102,11 +102,11 @@ fields = {
     # What active validators are part of the attester set
     # at what height, and in what shard. Starts at slot
     # last_state_recalc - CYCLE_LENGTH
-    'indices_for_heights': [[ShardAndCommittee]],
+    'indices_for_slots': [[ShardAndCommittee]],
     # The last justified slot
     'last_justified_slot': 'int64',
     # Number of consecutive justified slots ending at this one
-    'justified_streak': 'int16',
+    'justified_streak': 'int64',
     # The last finalized slot
     'last_finalized_slot': 'int64',
     # The current dynasty
@@ -198,7 +198,7 @@ Here's an example of its working (green is finalized blocks, yellow is justified
 
 We now define the state transition function. At the high level, the state transition is made up of two parts:
 
-1. The crystallized state realculation, which happens only if `slot_number >= last_state_recalc + CYCLE_LENGTH`, and affects the `CrystallizedState` and `ActiveState`
+1. The crystallized state realculation, which happens only if `block.slot_number >= last_state_recalc + CYCLE_LENGTH`, and affects the `CrystallizedState` and `ActiveState`
 2. The per-block processing, which happens every block (if during an epoch transition block, it happens after the epoch transition), and affects the `ActiveState` only
 
 The epoch transition generally focuses on changes to the validator set, including adjusting balances and adding and removing validators, as well as processing crosslinks and setting up FFG checkpoints, and the per-block processing generally focuses on verifying aggregate signatures and saving temporary records relating to the in-block activity in the `ActiveState`.
@@ -222,7 +222,6 @@ Now, a function that shuffles this list:
 ```python
 def shuffle(lst, seed):
     assert len(lst) <= 16777216
-    rand_max = 16777216 - 16777216 % len(lst)
     o = [x for x in lst]
     source = seed
     i = 0
@@ -233,7 +232,8 @@ def shuffle(lst, seed):
             remaining = len(lst) - i
             if remaining == 0:
                 break
-            if len(lst) < rand_max:
+            rand_max = 16777216 - 16777216 % remaining
+            if m < rand_max:
                 replacement_pos = (m % remaining) + i
                 o[i], o[replacement_pos] = o[replacement_pos], o[i]
                 i += 1
@@ -275,9 +275,25 @@ Here's a diagram of what's going on:
 
 ![](http://vitalik.ca/files/ShuffleAndAssign.png?1)
 
+We also define:
+
+```python
+def get_indices_for_slot(crystallized_state, active_state, slot):
+    ifh_start = crystallized_state.last_state_recalc - CYCLE_LENGTH
+    assert ifh_start <= slot < ifh_start + CYCLE_LENGTH * 2
+    return crystallized_state.indices_for_slots[slot - ifh_start]
+
+def get_block_hash(crystallized_state, active_state, curblock, slot):
+    sback = curblock.slot_number - CYCLE_LENGTH * 2
+    assert sback <= slot < sback + CYCLE_LENGTH * 2
+    return active_state.recent_block_hashes[slot - sback]
+```
+
+`get_block_hash(*, *, h)` should always return the block in the chain at height `h`, and `get_indices_for_slot(*, *, h)` should not change unless the dynasty changes.
+
 ### On startup
 
-* Let `x = get_new_shuffling(bytes([0] * 32), validators, 1, 0)` and set `crystallized_state.indices_for_heights` to `x + x`
+* Let `x = get_new_shuffling(bytes([0] * 32), validators, 1, 0)` and set `crystallized_state.indices_for_slots` to `x + x`
 * Set `crystallized_state.dynasty = 1`
 * Set `crystallized_state.crosslink_records` to `[CrosslinkRecord(dynasty=0, hash= bytes([0] * 32)) for i in range(SHARD_COUNT)]`
 * Set `total_deposits` to `sum([x.balance for x in validators])`
@@ -296,6 +312,8 @@ def get_new_recent_block_hashes(old_block_hashes, parent_slot,
     return old_block_hashes[d:] + [parent_hash] * min(d, len(old_block_hashes))
 ```
 
+The output of `get_block_hash` should not change, except that it will no longer throw for `current_slot - 1`, and will now throw for `current_slot - CYCLE_LENGTH * 2 - 1`
+
 A block can have 0 or more `AttestationRecord` objects, where each `AttestationRecord` object has the following fields:
 
 ```python
@@ -307,7 +325,7 @@ fields = {
     # List of block hashes that this signature is signing over that
     # are NOT part of the current chain, in order of oldest to newest
     'oblique_parent_hashes': ['hash32'],
-    # Block hash in the in the in the shard that we are attesting to
+    # Block hash in the shard that we are attesting to
     'shard_block_hash': 'hash32',
     # Who is participating
     'attester_bitfield': 'bytes',
@@ -318,27 +336,33 @@ fields = {
 
 For each one of these votes [TODO]:
 
-* Verify that `slot < block.slot_number` and `slot > max(block.slot_number - CYCLE_LENGTH, 0)`
-* Compute `parent_hashes` = `recent_block_hashes[CYCLE_LENGTH + slot - block.slot_number: CYCLE_LENGTH * 2 + slot - block.slot_number - len(oblique_parent_hashes)] + oblique_parent_hashes`
-* Find the `indices_for_heights[slot - last_state_recalc - CYCLE_LENGTH][x].validators`, choosing `x` so that `indices_for_heights[slot - last_epoch_start][x].shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record. Call the index list that you get from this `attestation_indices`
+* Verify that `slot < block.slot_number` and `slot >= max(block.slot_number - CYCLE_LENGTH, 0)`
+* Compute `parent_hashes` = `[get_block_hash(crystallized_state, active_state, block, slot - CYCLE_LENGTH + i) for i in range(CYCLE_LENGTH - len(oblique_parent_hashes))] + oblique_parent_hashes`
+* Let `attestation_indices` be `get_indices_for_slot(crystallized_state, active_state, slot)[x]`, choosing `x` so that `attestation_indices.shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record.
 * Verify that `len(attester_bitfield) == ceil_div8(len(attestation_indices))`, where `ceil_div8 = (x + 7) // 8`. Verify that bits `len(attestation_indices)....` and higher, if present (i.e. `len(attestation_indices)` is not a multiple of 8), are all zero
 * Derive a group public key by adding the public keys of all of the attesters in `attestation_indices` for whom the corresponding bit in `attester_bitfield` (the ith bit is `(attester_bitfield[i // 8] >> (7 - (i %8))) % 2`) equals 1
-* Verify that `aggregate_sig` verifies using the group pubkey generated and `hash((slot % CYCLE_LENGTH) + parent_hashes + shard_id + shard_block_hash)` as the message.
+* Verify that `aggregate_sig` verifies using the group pubkey generated and `hash((slot % CYCLE_LENGTH).to_bytes(8, 'big') + parent_hashes + shard_id + shard_block_hash)` as the message.
 
 Extend the list of `AttestationRecord` objects in the `active_state`, ordering the new additions in the same order as they came in the block.
 
-Verify that the `slot % len(indices_for_heights[slot-1][0])`'th attester in `indices_for_heights[slot-1][0]`is part of at least one of the `AttestationRecord` objects; this attester can be considered to be the proposer of the block.
+Verify that the `slot % len(get_indices_for_slot(crystallized_state, active_state, slot-1)[0])`'th attester in `get_indices_for_slot(crystallized_state, active_state, slot-1)[0]`is part of at least one of the `AttestationRecord` objects; this attester can be considered to be the proposer of the block.
 
-### Cycle length recalculations
+
+### State recalculations
+
+Repeat while `slot - last_state_recalc >= CYCLE_LENGTH`:
 
 For all slots `s` in `last_state_recalc - CYCLE_LENGTH ... last_state_recalc - 1`:
 
 * Determine the total set of validators that voted for that block at least once
 * Determine the total balance of these validators. If this value times three equals or exceeds the total balance of all active validators times two, set `last_justified_slot = max(last_justified_slot, s)` and `justified_streak += 1`. Otherwise, set `justified_streak = 0`
-* If `justified_streak >= CYCLE_LENGTH + 1`, set `last_finalized_slot = max(last_finalized_slot, s)`
+* If `justified_streak >= CYCLE_LENGTH + 1`, set `last_finalized_slot = max(last_finalized_slot, s - CYCLE_LENGTH - 1)`
 * Remove all attestation records older than slot `last_state_recalc`
-* Set `last_state_recalc = slot`
-* Set `indices_for_heights[:CYCLE_LENGTH] = indices_for_heights[CYCLE_LENGTH:]`
+
+Also:
+
+* Set `last_state_recalc += CYCLE_LENGTH`
+* Set `indices_for_slots[:CYCLE_LENGTH] = indices_for_slots[CYCLE_LENGTH:]`
 
 For all (`shard_id`, `shard_block_hash`) tuples, compute the total deposit size of validators that voted for that block hash for that shard. If this value times three equals or exceeds the total balance of all validators in the committee times two, and the current dynasty exceeds `crosslink_records[shard_id].dynasty`, set `crosslink_records[shard_id] = CrosslinkRecord(dynasty=current_dynasty, hash=shard_block_hash)`.
 
