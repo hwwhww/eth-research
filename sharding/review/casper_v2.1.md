@@ -30,7 +30,7 @@ Note: the python code at https://github.com/ethereum/beacon_chain and [an ethres
 * **Slot** - a period of 8 seconds, during which one proposer has the ability to create a block and some attesters have the ability to make attestations
 * **Dynasty transition** - a change of the validator set
 * **Dynasty** - the number of dynasty transitions that have happened in a given chain since genesis
-* **Cycle** - a period during which all validators get exactly one chance to vote (unless a dynasty transition happens inside of one)
+* **Cycle** - a span of blocks during which all validators get exactly one chance to make an attestation (unless a dynasty transition happens inside of one)
 * **Finalized**, **justified** - see Casper FFG finalization here: https://arxiv.org/abs/1710.09437
 
 ### Constants
@@ -100,7 +100,7 @@ fields = {
     # Last CrystallizedState recalculation
     'last_state_recalc': 'int64',
     # What active validators are part of the attester set
-    # at what height, and in what shard. Starts at slot
+    # at what slot, and in what shard. Starts at slot
     # last_state_recalc - CYCLE_LENGTH
     'indices_for_slots': [[ShardAndCommittee]],
     # The last justified slot
@@ -119,7 +119,7 @@ fields = {
     'total_deposits': 'int256',
     # Used to select the committees for each shard
     'dynasty_seed': 'hash32',
-    # Last epoch the crosslink seed was reset
+    # Last time the crosslink seed was reset
     'dynasty_seed_last_reset': 'int64'
 }
 ```
@@ -184,7 +184,7 @@ Block production is significantly different because of the proof of stake mechan
 
 ### Beacon chain fork choice rule
 
-The beacon chain uses the Casper FFG fork choice rule of "favor the chain containing the highest-epoch justified checkpoint". To choose between chains that are all descended from the same justified checkpoint, the chain uses "recursive proximity to justification" (RPJ) to choose a checkpoint, then uses GHOST within an epoch.
+The beacon chain uses the Casper FFG fork choice rule of "favor the chain containing the highest-slot-number justified block". To choose between chains that are all descended from the same justified block, the chain uses "immediate message driven GHOST" (IMD GHOST) to choose the head of the chain.
 
 For a description see: **https://ethresear.ch/t/beacon-chain-casper-ffg-rpj-mini-spec/2760**
 
@@ -198,10 +198,10 @@ Here's an example of its working (green is finalized blocks, yellow is justified
 
 We now define the state transition function. At the high level, the state transition is made up of two parts:
 
-1. The crystallized state realculation, which happens only if `block.slot_number >= last_state_recalc + CYCLE_LENGTH`, and affects the `CrystallizedState` and `ActiveState`
-2. The per-block processing, which happens every block (if during an epoch transition block, it happens after the epoch transition), and affects the `ActiveState` only
+1. The crystallized state recalculation, which happens only if `block.slot_number >= last_state_recalc + CYCLE_LENGTH`, and affects the `CrystallizedState` and `ActiveState`
+2. The per-block processing, which happens every block (if during a crystallized state recalculation block, it happens after the crystallized state recalculation), and affects the `ActiveState` only
 
-The epoch transition generally focuses on changes to the validator set, including adjusting balances and adding and removing validators, as well as processing crosslinks and setting up FFG checkpoints, and the per-block processing generally focuses on verifying aggregate signatures and saving temporary records relating to the in-block activity in the `ActiveState`.
+The crystallized state recalculation generally focuses on changes to the validator set, including adjusting balances and adding and removing validators, as well as processing crosslinks and managing block justification, and the per-block processing generally focuses on verifying aggregate signatures and saving temporary records relating to the in-block activity in the `ActiveState`.
 
 ### Helper functions
 
@@ -253,19 +253,21 @@ Now, our combined helper method:
 def get_new_shuffling(seed, validators, dynasty, crosslinking_start_shard):
     avs = get_active_validator_indices(validators, dynasty)
     if len(avs) >= CYCLE_LENGTH * MIN_COMMITTEE_SIZE:
-        committees_per_slot = int(len(avs) // CYCLE_LENGTH // (MIN_COMMITTEE_SIZE * 2)) + 1 
+        committees_per_slot = len(avs) // CYCLE_LENGTH // (MIN_COMMITTEE_SIZE * 2) + 1 
         slots_per_committee = 1
     else:
         committees_per_slot = 1
         slots_per_committee = 1
-        while len(avs) * slots_per_committee < CYCLE_LENGTH * MIN_COMMITTEE_SIZE and slots_per_committee < CYCLE_LENGTH:
+        while len(avs) * slots_per_committee < CYCLE_LENGTH * MIN_COMMITTEE_SIZE \
+                and slots_per_committee < CYCLE_LENGTH:
             slots_per_committee *= 2
     o = []
-    for i, height_indices in enumerate(split(shuffle(avs, seed), CYCLE_LENGTH)):
-        shard_indices = split(height_indices, committees_per_slot)
+    for i, slot_indices in enumerate(split(shuffle(avs, seed), CYCLE_LENGTH)):
+        shard_indices = split(slot_indices, committees_per_slot)
+        shard_id_start = crosslinking_start_shard + \
+            i * committees_per_slot // slots_per_committee
         o.append([ShardAndCommittee(
-            shard_id = crosslinking_start_shard + 
-                       i * committees_per_slot // slots_per_committee + j,
+            shard_id = (shard_id_start + j) % SHARD_COUNT,
             committee = indices
         ) for j, indices in enumerate(shard_indices)])
     return o
@@ -278,18 +280,18 @@ Here's a diagram of what's going on:
 We also define:
 
 ```python
-def get_indices_for_slot(crystallized_state, active_state, slot):
+def get_indices_for_slot(crystallized_state, slot):
     ifh_start = crystallized_state.last_state_recalc - CYCLE_LENGTH
     assert ifh_start <= slot < ifh_start + CYCLE_LENGTH * 2
     return crystallized_state.indices_for_slots[slot - ifh_start]
 
-def get_block_hash(crystallized_state, active_state, curblock, slot):
+def get_block_hash(active_state, curblock, slot):
     sback = curblock.slot_number - CYCLE_LENGTH * 2
     assert sback <= slot < sback + CYCLE_LENGTH * 2
     return active_state.recent_block_hashes[slot - sback]
 ```
 
-`get_block_hash(*, *, h)` should always return the block in the chain at height `h`, and `get_indices_for_slot(*, *, h)` should not change unless the dynasty changes.
+`get_block_hash(*, *, h)` should always return the block in the chain at slot `h`, and `get_indices_for_slot(*, h)` should not change unless the dynasty changes.
 
 ### On startup
 
@@ -329,23 +331,27 @@ fields = {
     'shard_block_hash': 'hash32',
     # Who is participating
     'attester_bitfield': 'bytes',
+    # Last justified block
+    'justified_slot': 'int256',
+    'justified_block_hash': 'hash32',
     # The actual signature
     'aggregate_sig': ['int256']
 }
 ```
 
-For each one of these votes [TODO]:
+For each one of these attestations [TODO]:
 
 * Verify that `slot < block.slot_number` and `slot >= max(block.slot_number - CYCLE_LENGTH, 0)`
-* Compute `parent_hashes` = `[get_block_hash(crystallized_state, active_state, block, slot - CYCLE_LENGTH + i) for i in range(CYCLE_LENGTH - len(oblique_parent_hashes))] + oblique_parent_hashes`
-* Let `attestation_indices` be `get_indices_for_slot(crystallized_state, active_state, slot)[x]`, choosing `x` so that `attestation_indices.shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record.
+* Verify that the `justified_slot` and `justified_block_hash` given are in the chain and are equal to or earlier than the `last_justified_slot` in the crystallized state.
+* Compute `parent_hashes` = `[get_block_hash(active_state, block, slot - CYCLE_LENGTH + i) for i in range(CYCLE_LENGTH - len(oblique_parent_hashes))] + oblique_parent_hashes`
+* Let `attestation_indices` be `get_indices_for_slot(crystallized_state, slot)[x]`, choosing `x` so that `attestation_indices.shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record.
 * Verify that `len(attester_bitfield) == ceil_div8(len(attestation_indices))`, where `ceil_div8 = (x + 7) // 8`. Verify that bits `len(attestation_indices)....` and higher, if present (i.e. `len(attestation_indices)` is not a multiple of 8), are all zero
 * Derive a group public key by adding the public keys of all of the attesters in `attestation_indices` for whom the corresponding bit in `attester_bitfield` (the ith bit is `(attester_bitfield[i // 8] >> (7 - (i %8))) % 2`) equals 1
-* Verify that `aggregate_sig` verifies using the group pubkey generated and `hash((slot % CYCLE_LENGTH).to_bytes(8, 'big') + parent_hashes + shard_id + shard_block_hash)` as the message.
+* Verify that `aggregate_sig` verifies using the group pubkey generated and `hash(slot.to_bytes(8, 'big') + parent_hashes + shard_id + shard_block_hash)` as the message.
 
 Extend the list of `AttestationRecord` objects in the `active_state`, ordering the new additions in the same order as they came in the block.
 
-Verify that the `slot % len(get_indices_for_slot(crystallized_state, active_state, slot-1)[0])`'th attester in `get_indices_for_slot(crystallized_state, active_state, slot-1)[0]`is part of at least one of the `AttestationRecord` objects; this attester can be considered to be the proposer of the block.
+Verify that the `slot % len(get_indices_for_slot(crystallized_state, slot)[0])`'th attester in `get_indices_for_slot(crystallized_state, slot)[0]`is part of at least one of the `AttestationRecord` objects; this attester can be considered to be the proposer of the block.
 
 
 ### State recalculations
@@ -354,7 +360,7 @@ Repeat while `slot - last_state_recalc >= CYCLE_LENGTH`:
 
 For all slots `s` in `last_state_recalc - CYCLE_LENGTH ... last_state_recalc - 1`:
 
-* Determine the total set of validators that voted for that block at least once
+* Determine the total set of validators that attested to that block at least once
 * Determine the total balance of these validators. If this value times three equals or exceeds the total balance of all active validators times two, set `last_justified_slot = max(last_justified_slot, s)` and `justified_streak += 1`. Otherwise, set `justified_streak = 0`
 * If `justified_streak >= CYCLE_LENGTH + 1`, set `last_finalized_slot = max(last_finalized_slot, s - CYCLE_LENGTH - 1)`
 * Remove all attestation records older than slot `last_state_recalc`
@@ -364,7 +370,7 @@ Also:
 * Set `last_state_recalc += CYCLE_LENGTH`
 * Set `indices_for_slots[:CYCLE_LENGTH] = indices_for_slots[CYCLE_LENGTH:]`
 
-For all (`shard_id`, `shard_block_hash`) tuples, compute the total deposit size of validators that voted for that block hash for that shard. If this value times three equals or exceeds the total balance of all validators in the committee times two, and the current dynasty exceeds `crosslink_records[shard_id].dynasty`, set `crosslink_records[shard_id] = CrosslinkRecord(dynasty=current_dynasty, hash=shard_block_hash)`.
+For all (`shard_id`, `shard_block_hash`) tuples, compute the total deposit size of validators that attested to that block hash for that shard. If this value times three equals or exceeds the total balance of all validators in the committee times two, and the current dynasty exceeds `crosslink_records[shard_id].dynasty`, set `crosslink_records[shard_id] = CrosslinkRecord(dynasty=current_dynasty, hash=shard_block_hash)`.
 
 TODO:
 
@@ -393,7 +399,7 @@ Note: this is ~70% complete. Main sections missing are:
 Slashing conditions may include:
 
 
-    Casper FFG height equivocation
+    Casper FFG slot equivocation
     Casper FFG surround
     Beacon chain proposal equivocation
     Shard chain proposal equivocation
