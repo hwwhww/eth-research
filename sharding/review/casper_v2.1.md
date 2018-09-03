@@ -41,6 +41,8 @@ Note: the python code at https://github.com/ethereum/beacon_chain and [an ethres
 * **SLOT_DURATION** - 8 seconds
 * **CYCLE_LENGTH** - 64 slots
 * **MIN_COMMITTEE_SIZE** - 128 (rationale: see recommended minimum 111 here https://vitalik.ca/files/Ithaca201807_Sharding.pdf)
+* **SQRT_E_DROP_TIME** - a constant set to reflect the amount of time it will take for the quadratic leak to cut nonparticipating validators' deposits by ~39.4%. Currently set to 2**20 seconds (~12 days).
+* **BASE_REWARD_FACTOR** - the per-slot interest rate assuming all validators are participating, assuming total deposits of 1 ETH. Currently set to `2**-15 = 0.000030517578125`, corresponding to ~3.88% annual interest assuming 10 million participating ETH.
 
 ### PoW main chain changes
 
@@ -163,6 +165,8 @@ And a CrosslinkRecord contains information about the last fully formed crosslink
 fields = {
     # What dynasty the crosslink was submitted in
     'dynasty': 'int64',
+    # What slot
+    'slot': 'int64',
     # The block hash
     'hash': 'hash32'
 }
@@ -297,7 +301,7 @@ def get_block_hash(active_state, curblock, slot):
 
 * Let `x = get_new_shuffling(bytes([0] * 32), validators, 1, 0)` and set `crystallized_state.indices_for_slots` to `x + x`
 * Set `crystallized_state.dynasty = 1`
-* Set `crystallized_state.crosslink_records` to `[CrosslinkRecord(dynasty=0, hash= bytes([0] * 32)) for i in range(SHARD_COUNT)]`
+* Set `crystallized_state.crosslink_records` to `[CrosslinkRecord(dynasty=0, slot=0, hash=bytes([0] * 32)) for i in range(SHARD_COUNT)]`
 * Set `total_deposits` to `sum([x.balance for x in validators])`
 * Set `recent_block_hashes` to `[bytes([0] * 32) for _ in range(CYCLE_LENGTH * 2)]`
 
@@ -343,7 +347,7 @@ For each one of these attestations [TODO]:
 
 * Verify that `slot < block.slot_number` and `slot >= max(block.slot_number - CYCLE_LENGTH, 0)`
 * Verify that the `justified_slot` and `justified_block_hash` given are in the chain and are equal to or earlier than the `last_justified_slot` in the crystallized state.
-* Compute `parent_hashes` = `[get_block_hash(active_state, block, slot - CYCLE_LENGTH + i) for i in range(CYCLE_LENGTH - len(oblique_parent_hashes))] + oblique_parent_hashes`
+* Compute `parent_hashes` = `[get_block_hash(active_state, block, slot - CYCLE_LENGTH + i) for i in range(1, CYCLE_LENGTH - len(oblique_parent_hashes) + 1)] + oblique_parent_hashes` (eg, if `CYCLE_LENGTH = 4`, `slot = 5`, the actual block hashes starting from slot 0 are `Z A B C D E F G H I J`, and `oblique_parent_hashes = [D', E']` then `parent_hashes = [B, C, D' E']`)
 * Let `attestation_indices` be `get_indices_for_slot(crystallized_state, slot)[x]`, choosing `x` so that `attestation_indices.shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record.
 * Verify that `len(attester_bitfield) == ceil_div8(len(attestation_indices))`, where `ceil_div8 = (x + 7) // 8`. Verify that bits `len(attestation_indices)....` and higher, if present (i.e. `len(attestation_indices)` is not a multiple of 8), are all zero
 * Derive a group public key by adding the public keys of all of the attesters in `attestation_indices` for whom the corresponding bit in `attester_bitfield` (the ith bit is `(attester_bitfield[i // 8] >> (7 - (i %8))) % 2`) equals 1
@@ -363,19 +367,31 @@ For all slots `s` in `last_state_recalc - CYCLE_LENGTH ... last_state_recalc - 1
 * Determine the total set of validators that attested to that block at least once
 * Determine the total balance of these validators. If this value times three equals or exceeds the total balance of all active validators times two, set `last_justified_slot = max(last_justified_slot, s)` and `justified_streak += 1`. Otherwise, set `justified_streak = 0`
 * If `justified_streak >= CYCLE_LENGTH + 1`, set `last_finalized_slot = max(last_finalized_slot, s - CYCLE_LENGTH - 1)`
-* Remove all attestation records older than slot `last_state_recalc`
 
-Also:
+For all (`shard_id`, `shard_block_hash`) tuples, compute the total deposit size of validators that attested to that block hash for that shard. If this value times three equals or exceeds the total balance of all validators in the committee times two, and the current dynasty exceeds `crosslink_records[shard_id].dynasty`, set `crosslink_records[shard_id] = CrosslinkRecord(dynasty=current_dynasty, slot=block.slot_number, hash=shard_block_hash)`.
+
+Let `time_since_finality = block.slot - last_finalized_slot`, and let `B` be the balance of any given validator whose balance we are adjusting, not including any balance changes from this round of state recalculation. Let `reward_factor = ISSUANCE_FACTOR / int(sqrt(total_deposits in ETH))`, and `quadratic_penalty_quotient = int(sqrt(SQRT_E_DROP_TIME / SLOT_DURATION))`. For each slot in the range `last_state_recalc ... last_state_recalc + CYCLE_LENGTH - 1`:
+
+* Let `total_participated_deposits` be the total balance of validators that voted for the correct hash in that slot. If `time_since_finality <= 2 * CYCLE_LENGTH`, then adjust participating and non-participating validators' balances as follows:
+    * Participating validators gain `B * reward_factor * (2 * total_participated_deposits / total_deposits - 1)`
+    * Nonparticipating validators lose `B * reward_factor`
+* Otherwise, adjust as follows:
+    * Participating validators' balances are unchanged
+    * Nonparticipating validators lose `B * reward_factor * 0.5 + time_since_finality ** 2 / quadratic_penalty_quotient`
+
+For each shard S for which a crosslink committee exists in this epoch, let V be the corresponding validator set. Let `B` be the balance of any given validator whose balance we are adjusting, not including any balance changes from this round of state recalculation. For each S, V do the following:
+
+* Let `total_v_deposits` be the total balance of V, and `total_participated_deposits` be the total balance of the subset of V that participated.
+* Let `time_since_last_confirmation` be `block.slot_number - crosslink_records[S].slot`
+* Adjust balances as follows:
+    * If `crosslink_records[S].dynasty == current_dynasty`, no reward adjustments
+    * Otherwise, participating validators' balances are increased by `B * reward_factor * (2 * total_participated_deposits / total_v_deposits - 1)`, and non-participating validators' balances are decreased by `B * reward_factor + B * reward_factor * 0.5 + time_since_finality ** 2 / quadratic_penalty_quotient`
+
+Finally:
 
 * Set `last_state_recalc += CYCLE_LENGTH`
 * Set `indices_for_slots[:CYCLE_LENGTH] = indices_for_slots[CYCLE_LENGTH:]`
-
-For all (`shard_id`, `shard_block_hash`) tuples, compute the total deposit size of validators that attested to that block hash for that shard. If this value times three equals or exceeds the total balance of all validators in the committee times two, and the current dynasty exceeds `crosslink_records[shard_id].dynasty`, set `crosslink_records[shard_id] = CrosslinkRecord(dynasty=current_dynasty, hash=shard_block_hash)`.
-
-TODO:
-
-* Rewards for FFG participation
-* Rewards for committee participation
+* Remove all attestation records older than slot `last_state_recalc`
 
 ### Dynasty transition
 
@@ -384,7 +400,7 @@ TODO. Stub for now.
 
 -------
 
-Note: this is ~70% complete. Main sections missing are:
+Note: this is ~70% complete. The main sections that are missing are:
 
 * Validator login/logout logic
 * Logic for the formats of shard chains, who proposes shard blocks, etc. (in an initial release, if desired we could make crosslinks just be Merkle roots of blobs of data; in any case, one can philosophically view the whole point of the shard chains as being a coordination device for choosing what blobs of data to propose as crosslinks)
