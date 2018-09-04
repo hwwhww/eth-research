@@ -9,9 +9,9 @@ In this protocol, there is a central PoS chain which stores and manages the curr
 The primary source of load on the PoS chain is **attestations**. An attestation has a double role:
 
 1. It attests to some parent block in the beacon chain
-2. It attests to a block hash in a shard (a sufficient number of such attestations create a "crosslink", confirming that shard block into the main chain).
+2. It attests to a block hash in a shard (a sufficient number of such attestations create a "crosslink", confirming that shard block into the beacon chain).
 
-Every shard (e.g. there might be 1024 shards in total) is itself a PoS chain, and the shard chains are where the transactions and accounts will be stored. The crosslinks serve to "confirm" segments of the shard chains into the main chain, and are also the primary way through which the different shards will be able to talk to each other.
+Every shard (e.g. there might be 1024 shards in total) is itself a PoS chain, and the shard chains are where the transactions and accounts will be stored. The crosslinks serve to "confirm" segments of the shard chains into the beacon chain, and are also the primary way through which the different shards will be able to talk to each other.
 
 Note that one can also consider a simpler "minimal sharding algorithm" where crosslinks are simply hashes of proposed blocks of data that are not themselves chained to each other in any way.
 
@@ -38,18 +38,19 @@ Note: the python code at https://github.com/ethereum/beacon_chain and [an ethres
 * **SHARD_COUNT** - a constant referring to the number of shards. Currently set to 1024.
 * **DEPOSIT_SIZE** - 32 ETH
 * **MAX_VALIDATOR_COUNT** - 2<sup>22</sup> = 4194304 # Note: this means that up to ~134 million ETH can stake at the same time
+* **GENESIS_TIME** - time of beacon chain startup (slot 0) in seconds since the Unix epoch
 * **SLOT_DURATION** - 8 seconds
 * **CYCLE_LENGTH** - 64 slots
 * **MIN_COMMITTEE_SIZE** - 128 (rationale: see recommended minimum 111 here https://vitalik.ca/files/Ithaca201807_Sharding.pdf)
 * **SQRT_E_DROP_TIME** - a constant set to reflect the amount of time it will take for the quadratic leak to cut nonparticipating validators' deposits by ~39.4%. Currently set to 2**20 seconds (~12 days).
-* **BASE_REWARD_FACTOR** - the per-slot interest rate assuming all validators are participating, assuming total deposits of 1 ETH. Currently set to `2**-15 = 0.000030517578125`, corresponding to ~3.88% annual interest assuming 10 million participating ETH.
+* **BASE_REWARD_QUOTIENT** - 1/this is the per-slot interest rate assuming all validators are participating, assuming total deposits of 1 ETH. Currently set to `2**15 = 32768`, corresponding to ~3.88% annual interest assuming 10 million participating ETH.
 
 ### PoW main chain changes
 
 This PoS/sharding proposal can be implemented separately from the existing PoW main chain. Only two changes to the PoW main chain are required (and the second one is technically not strictly necessary).
 
 * On the PoW main chain a contract is added; this contract allows you to deposit `DEPOSIT_SIZE` ETH; the `deposit` function also takes as arguments (i) `pubkey` (bytes), (ii) `withdrawal_shard_id` (int), (iii)  `withdrawal_addr` (address), (iv) `randao_commitment` (bytes32), (v) `bls_proof_of_possession`
-* PoW Main chain clients will implement a method, `prioritize(block_hash, value)`. If the block is available and has been verified, this method sets its score to the given value, and recursively adjusts the scores of all descendants. This allows the PoS beacon chain's finality gadget to also implicitly finalize main chain blocks. Note that implementing this into the PoW client *is* a change to the PoW fork choice rule so is a sort of fork.
+* PoW Main chain clients will implement a method, `prioritize(block_hash, value)`. If the block is available and has been verified, this method sets its score to the given value, and recursively adjusts the scores of all descendants. This allows the PoS beacon chain's finality gadget to also implicitly finalize PoW main chain blocks. Note that implementing this into the PoW client *is* a change to the PoW fork choice rule so is a sort of fork.
 
 ### Beacon chain
 
@@ -137,7 +138,7 @@ fields = {
 }
 ```
 
-Each ValidatorRecord is an object containing information about a validator:
+Each `ValidatorRecord` is an object containing information about a validator:
 
 ```python
 fields = {
@@ -159,7 +160,7 @@ fields = {
 }
 ```
 
-And a CrosslinkRecord contains information about the last fully formed crosslink to be submitted into the chain:
+And a `CrosslinkRecord` contains information about the last fully formed crosslink to be submitted into the chain:
 
 ```python
 fields = {
@@ -345,7 +346,7 @@ fields = {
 
 For each one of these attestations [TODO]:
 
-* Verify that `slot < block.slot_number` and `slot >= max(block.slot_number - CYCLE_LENGTH, 0)`
+* Verify that `slot <= parent.slot_number` and `slot >= max(parent.slot_number - CYCLE_LENGTH + 1, 0)`
 * Verify that the `justified_slot` and `justified_block_hash` given are in the chain and are equal to or earlier than the `last_justified_slot` in the crystallized state.
 * Compute `parent_hashes` = `[get_block_hash(active_state, block, slot - CYCLE_LENGTH + i) for i in range(1, CYCLE_LENGTH - len(oblique_parent_hashes) + 1)] + oblique_parent_hashes` (eg, if `CYCLE_LENGTH = 4`, `slot = 5`, the actual block hashes starting from slot 0 are `Z A B C D E F G H I J`, and `oblique_parent_hashes = [D', E']` then `parent_hashes = [B, C, D' E']`)
 * Let `attestation_indices` be `get_indices_for_slot(crystallized_state, slot)[x]`, choosing `x` so that `attestation_indices.shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record.
@@ -355,7 +356,7 @@ For each one of these attestations [TODO]:
 
 Extend the list of `AttestationRecord` objects in the `active_state`, ordering the new additions in the same order as they came in the block.
 
-Verify that the `slot % len(get_indices_for_slot(crystallized_state, slot)[0])`'th attester in `get_indices_for_slot(crystallized_state, slot)[0]`is part of at least one of the `AttestationRecord` objects; this attester can be considered to be the proposer of the block.
+Verify that the `parent.slot_number % len(get_indices_for_slot(crystallized_state, parent.slot_number)[0])`'th attester in `get_indices_for_slot(crystallized_state, parent.slot_number)[0]`is part of at least one of the `AttestationRecord` objects; this attester can be considered to be the proposer of the parent block. In general, when a block is produced, it is broadcasted at the network layer along with the attestation  from its proposer.
 
 
 ### State recalculations
@@ -370,14 +371,24 @@ For all slots `s` in `last_state_recalc - CYCLE_LENGTH ... last_state_recalc - 1
 
 For all (`shard_id`, `shard_block_hash`) tuples, compute the total deposit size of validators that attested to that block hash for that shard. If this value times three equals or exceeds the total balance of all validators in the committee times two, and the current dynasty exceeds `crosslink_records[shard_id].dynasty`, set `crosslink_records[shard_id] = CrosslinkRecord(dynasty=current_dynasty, slot=block.slot_number, hash=shard_block_hash)`.
 
-Let `time_since_finality = block.slot - last_finalized_slot`, and let `B` be the balance of any given validator whose balance we are adjusting, not including any balance changes from this round of state recalculation. Let `reward_factor = ISSUANCE_FACTOR / int(sqrt(total_deposits in ETH))`, and `quadratic_penalty_quotient = int(sqrt(SQRT_E_DROP_TIME / SLOT_DURATION))`. For each slot in the range `last_state_recalc ... last_state_recalc + CYCLE_LENGTH - 1`:
+#### Balance recalculations related to FFG rewards
+
+
+Let `time_since_finality = block.slot - last_finalized_slot`, and let `B` be the balance of any given validator whose balance we are adjusting, not including any balance changes from this round of state recalculation. Let:
+
+* `reward_quotient = BASE_REWARD_QUOTIENT * int(sqrt(total_deposits in ETH))` (1/this is the per-slot max interest rate)
+* `quadratic_penalty_quotient = int(sqrt(SQRT_E_DROP_TIME / SLOT_DURATION))` (after D slots, ~D<sup>2</sup>/2 divided by this is the portion lost by offline validators)
+
+For each slot in the range `last_state_recalc ... last_state_recalc + CYCLE_LENGTH - 1`:
 
 * Let `total_participated_deposits` be the total balance of validators that voted for the correct hash in that slot. If `time_since_finality <= 2 * CYCLE_LENGTH`, then adjust participating and non-participating validators' balances as follows:
     * Participating validators gain `B * reward_factor * (2 * total_participated_deposits / total_deposits - 1)`
     * Nonparticipating validators lose `B * reward_factor`
 * Otherwise, adjust as follows:
     * Participating validators' balances are unchanged
-    * Nonparticipating validators lose `B * reward_factor * 0.5 + time_since_finality ** 2 / quadratic_penalty_quotient`
+    * Nonparticipating validators lose `B * reward_factor + time_since_finality / quadratic_penalty_quotient`
+
+#### Balance recalculations related to crosslink rewards
 
 For each shard S for which a crosslink committee exists in this epoch, let V be the corresponding validator set. Let `B` be the balance of any given validator whose balance we are adjusting, not including any balance changes from this round of state recalculation. For each S, V do the following:
 
@@ -385,7 +396,7 @@ For each shard S for which a crosslink committee exists in this epoch, let V be 
 * Let `time_since_last_confirmation` be `block.slot_number - crosslink_records[S].slot`
 * Adjust balances as follows:
     * If `crosslink_records[S].dynasty == current_dynasty`, no reward adjustments
-    * Otherwise, participating validators' balances are increased by `B * reward_factor * (2 * total_participated_deposits / total_v_deposits - 1)`, and non-participating validators' balances are decreased by `B * reward_factor + B * reward_factor * 0.5 + time_since_finality ** 2 / quadratic_penalty_quotient`
+    * Otherwise, participating validators' balances are increased by `B * reward_factor * (2 * total_participated_deposits / total_v_deposits - 1)`, and non-participating validators' balances are decreased by `B * reward_factor + B * reward_factor * 0.5 + time_since_finality / quadratic_penalty_quotient`
 
 Finally:
 
@@ -404,7 +415,7 @@ Note: this is ~70% complete. The main sections that are missing are:
 
 * Validator login/logout logic
 * Logic for the formats of shard chains, who proposes shard blocks, etc. (in an initial release, if desired we could make crosslinks just be Merkle roots of blobs of data; in any case, one can philosophically view the whole point of the shard chains as being a coordination device for choosing what blobs of data to propose as crosslinks)
-* Logic for inducting queued validators from the main chain
+* Logic for inducting queued validators from the PoW main chain
 * Penalties for signing or attesting to non-canonical-chain blocks (update: may not be necessary, see https://ethresear.ch/t/attestation-committee-based-full-pos-chains/2259)
 * Slashing conditions
 * Logic for withdrawing deposits to shards
