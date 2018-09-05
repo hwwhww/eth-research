@@ -303,8 +303,8 @@ def get_block_hash(active_state, curblock, slot):
 * Let `x = get_new_shuffling(bytes([0] * 32), validators, 1, 0)` and set `crystallized_state.indices_for_slots` to `x + x`
 * Set `crystallized_state.dynasty = 1`
 * Set `crystallized_state.crosslink_records` to `[CrosslinkRecord(dynasty=0, slot=0, hash=bytes([0] * 32)) for i in range(SHARD_COUNT)]`
-* Set `total_deposits` to `sum([x.balance for x in validators])`
-* Set `recent_block_hashes` to `[bytes([0] * 32) for _ in range(CYCLE_LENGTH * 2)]`
+* Set `crystallized_state.total_deposits` to `sum([x.balance for x in validators])`
+* Set `active_state.recent_block_hashes` to `[bytes([0] * 32) for _ in range(CYCLE_LENGTH * 2)]`
 
 All other values in active and crystallized state can be set to zero or empty arrays depending on context.
 
@@ -348,7 +348,7 @@ For each one of these attestations [TODO]:
 
 * Verify that `slot <= parent.slot_number` and `slot >= max(parent.slot_number - CYCLE_LENGTH + 1, 0)`
 * Verify that the `justified_slot` and `justified_block_hash` given are in the chain and are equal to or earlier than the `last_justified_slot` in the crystallized state.
-* Compute `parent_hashes` = `[get_block_hash(active_state, block, slot - CYCLE_LENGTH + i) for i in range(1, CYCLE_LENGTH - len(oblique_parent_hashes) + 1)] + oblique_parent_hashes` (eg, if `CYCLE_LENGTH = 4`, `slot = 5`, the actual block hashes starting from slot 0 are `Z A B C D E F G H I J`, and `oblique_parent_hashes = [D', E']` then `parent_hashes = [B, C, D' E']`)
+* Compute `parent_hashes` = `[get_block_hash(active_state, block, slot - CYCLE_LENGTH + i) for i in range(1, CYCLE_LENGTH - len(oblique_parent_hashes) + 1)] + oblique_parent_hashes` (eg, if `CYCLE_LENGTH = 4`, `slot = 5`, the actual block hashes starting from slot 0 are `Z A B C D E F G H I J`, and `oblique_parent_hashes = [D', E']` then `parent_hashes = [B, C, D' E']`). Note that when *creating* an attestation for a block, the hash of that block itself won't yet be in the `active_state`, so you would need to add it explicitly.
 * Let `attestation_indices` be `get_indices_for_slot(crystallized_state, slot)[x]`, choosing `x` so that `attestation_indices.shard_id` equals the `shard_id` value provided to find the set of validators that is creating this attestation record.
 * Verify that `len(attester_bitfield) == ceil_div8(len(attestation_indices))`, where `ceil_div8 = (x + 7) // 8`. Verify that bits `len(attestation_indices)....` and higher, if present (i.e. `len(attestation_indices)` is not a multiple of 8), are all zero
 * Derive a group public key by adding the public keys of all of the attesters in `attestation_indices` for whom the corresponding bit in `attester_bitfield` (the ith bit is `(attester_bitfield[i // 8] >> (7 - (i %8))) % 2`) equals 1
@@ -408,7 +408,6 @@ Finally:
 
 TODO. Stub for now.
 
-
 -------
 
 Note: this is ~70% complete. The main sections that are missing are:
@@ -420,7 +419,6 @@ Note: this is ~70% complete. The main sections that are missing are:
 * Slashing conditions
 * Logic for withdrawing deposits to shards
 * Per-validator proofs of custody
-* Full rewards and penalties
 * Versioning and upgrades
 
 Slashing conditions may include:
