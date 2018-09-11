@@ -41,6 +41,7 @@ Note: the python code at https://github.com/ethereum/beacon_chain and [an ethres
 * **GENESIS_TIME** - time of beacon chain startup (slot 0) in seconds since the Unix epoch
 * **SLOT_DURATION** - 8 seconds
 * **CYCLE_LENGTH** - 64 slots
+* **MIN_DYNASTY_LENGTH** - 256 slots
 * **MIN_COMMITTEE_SIZE** - 128 (rationale: see recommended minimum 111 here https://vitalik.ca/files/Ithaca201807_Sharding.pdf)
 * **SQRT_E_DROP_TIME** - a constant set to reflect the amount of time it will take for the quadratic leak to cut nonparticipating validators' deposits by ~39.4%. Currently set to 2**20 seconds (~12 days).
 * **BASE_REWARD_QUOTIENT** - 1/this is the per-slot interest rate assuming all validators are participating, assuming total deposits of 1 ETH. Currently set to `2**15 = 32768`, corresponding to ~3.88% annual interest assuming 10 million participating ETH.
@@ -105,7 +106,7 @@ fields = {
     # What active validators are part of the attester set
     # at what slot, and in what shard. Starts at slot
     # last_state_recalc - CYCLE_LENGTH
-    'indices_for_slots': [[ShardAndCommittee]],
+    'shard_and_committee_for_slots': [[ShardAndCommittee]],
     # The last justified slot
     'last_justified_slot': 'int64',
     # Number of consecutive justified slots ending at this one
@@ -122,8 +123,8 @@ fields = {
     'total_deposits': 'int256',
     # Used to select the committees for each shard
     'dynasty_seed': 'hash32',
-    # Last time the crosslink seed was reset
-    'dynasty_seed_last_reset': 'int64'
+    # Start of the current dynasty
+    'dynasty_start': 'int64'
 }
 ```
 
@@ -177,13 +178,14 @@ fields = {
 
 Processing the beacon chain is fundamentally similar to processing a PoW chain in many respects. Clients download and process blocks, and maintain a view of what is the current "canonical chain", terminating at the current "head". However, because of the beacon chain's relationship with the existing PoW chain, and because it is a PoS chain, there are differences.
 
-For a block on the beacon chain to be processed by a node, three conditions have to be met:
+For a block on the beacon chain to be processed by a node, four conditions have to be met:
 
 * The parent pointed to by the `parent_hash` has already been processed and accepted
+* An attestation from the _proposer_ of the block (see later for definition) is included along with the block in the network message object
 * The PoW chain block pointed to by the `pow_chain_ref` has already been processed and accepted
 * The node's local clock time is greater than or equal to the minimum timestamp as computed by `GENESIS_TIME + slot_number * SLOT_DURATION`
 
-If these three conditions are not met, the client should delay processing the block until the three conditions are all satisfied.
+If these conditions are not met, the client should delay processing the block until the conditions are all satisfied.
 
 Block production is significantly different because of the proof of stake mechanism. A client simply checks what it thinks is the canonical chain when it should create a block, and looks up what its slot number is; when the slot arrives, it either proposes or attests to a block as required.
 
@@ -288,7 +290,7 @@ We also define:
 def get_indices_for_slot(crystallized_state, slot):
     ifh_start = crystallized_state.last_state_recalc - CYCLE_LENGTH
     assert ifh_start <= slot < ifh_start + CYCLE_LENGTH * 2
-    return crystallized_state.indices_for_slots[slot - ifh_start]
+    return crystallized_state.shard_and_committee_for_slots[slot - ifh_start]
 
 def get_block_hash(active_state, curblock, slot):
     sback = curblock.slot_number - CYCLE_LENGTH * 2
@@ -300,7 +302,7 @@ def get_block_hash(active_state, curblock, slot):
 
 ### On startup
 
-* Let `x = get_new_shuffling(bytes([0] * 32), validators, 1, 0)` and set `crystallized_state.indices_for_slots` to `x + x`
+* Let `x = get_new_shuffling(bytes([0] * 32), validators, 1, 0)` and set `crystallized_state.shard_and_committee_for_slots` to `x + x`
 * Set `crystallized_state.dynasty = 1`
 * Set `crystallized_state.crosslink_records` to `[CrosslinkRecord(dynasty=0, slot=0, hash=bytes([0] * 32)) for i in range(SHARD_COUNT)]`
 * Set `crystallized_state.total_deposits` to `sum([x.balance for x in validators])`
@@ -337,7 +339,7 @@ fields = {
     # Who is participating
     'attester_bitfield': 'bytes',
     # Last justified block
-    'justified_slot': 'int256',
+    'justified_slot': 'int64',
     'justified_block_hash': 'hash32',
     # The actual signature
     'aggregate_sig': ['int256']
@@ -401,12 +403,22 @@ For each shard S for which a crosslink committee exists in this epoch, let V be 
 Finally:
 
 * Set `last_state_recalc += CYCLE_LENGTH`
-* Set `indices_for_slots[:CYCLE_LENGTH] = indices_for_slots[CYCLE_LENGTH:]`
 * Remove all attestation records older than slot `last_state_recalc`
+* Set `shard_and_committee_for_slots[:CYCLE_LENGTH] = shard_and_committee_for_slots[CYCLE_LENGTH:]`
 
 ### Dynasty transition
 
-TODO. Stub for now.
+A dynasty transition can happen if all of the following criteria are satisfied:
+
+* `block.slot_number - crystallized_state.dynasty_start >= MIN_DYNASTY_LENGTH`
+* `last_finalized_slot > dynasty_start`
+* For every shard S in `shard_and_committee_for_slots`, `crosslink_records[S].slot > dynasty_start`
+
+Then:
+
+* Set `crystallized_state.dynasty += 1`
+* Let `next_start_shard = (shard_and_committee_for_slots[-1][-1].shard_id + 1) % SHARD_COUNT`
+* Set `shard_and_committee_for_slots[CYCLE_LENGTH:] = get_new_shuffling(block.parent_hash, validators, crystallized_state.dynasty, next_start_shard)`
 
 -------
 
